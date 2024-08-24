@@ -1,0 +1,14 @@
+content_image
+content_table
+content_text
+header_author
+header_category
+header_date
+header_hist
+header_severity
+header_table
+header_time
+header_title
+main_body
+new_insert
+spacer
