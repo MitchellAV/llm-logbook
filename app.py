@@ -1,43 +1,61 @@
 from typing import Any, NotRequired, TypedDict, cast
-from markdownify import MarkdownConverter, _todict
 from bs4 import BeautifulSoup, ResultSet, Tag, PageElement
 import os
-import urllib.parse
+import subprocess
+import json
 
 data_dir = "./data"
 output_dir = "./output"
 
 
-def md(
-    soup: BeautifulSoup,
-    options: dict[str, Any] | None = _todict(MarkdownConverter.DefaultOptions),
-) -> str:
-    markdown_converter = MarkdownConverter(options=options)
-    markdown_data = markdown_converter.convert_soup(soup)
-    return markdown_data
+class FileMetadata(TypedDict):
+    title: str
+    date: str
 
 
-def modify_markdownify_options():
-    options = _todict(MarkdownConverter.DefaultOptions)
+class HeaderMetadata(TypedDict, total=False):
+    header_author: str
+    header_category: str
+    header_date: str
+    header_hist: str
+    header_severity: str
+    header_table: str
+    header_time: str
+    header_title: str
 
-    # Modify the markdownify options
-    return options
+
+class ImageMetadata(TypedDict, total=False):
+    src: str | list[str] | None
+    alt: str | list[str] | None
+    href: str | list[str] | None
+    target: str | list[str] | None
 
 
-class HeaderMetadata(TypedDict):
-    header_author: NotRequired[str]
-    header_category: NotRequired[str]
-    header_date: NotRequired[str]
-    header_hist: NotRequired[str]
-    header_severity: NotRequired[str]
-    header_table: NotRequired[str]
-    header_time: NotRequired[str]
-    header_title: NotRequired[str]
+class ContentMetadata(TypedDict, total=False):
+    content_image: ImageMetadata
+    content_table: str
+    content_text: str
+
+
+# def md(
+#     soup: BeautifulSoup,
+#     options: dict[str, Any] | None = _todict(MarkdownConverter.DefaultOptions),
+# ) -> str:
+#     markdown_converter = MarkdownConverter(options=options)
+#     markdown_data = markdown_converter.convert_soup(soup)
+#     return markdown_data
+
+
+# def modify_markdownify_options():
+#     options = _todict(MarkdownConverter.DefaultOptions)
+
+#     # Modify the markdownify options
+#     return options
 
 
 def extract_header(header_rows: ResultSet[BeautifulSoup]):
     # Extract the header from the html content
-    header_metadata_list: list[HeaderMetadata] = []
+    header_metadata: HeaderMetadata = {}
 
     header_class_list = [
         "header_author",
@@ -50,27 +68,27 @@ def extract_header(header_rows: ResultSet[BeautifulSoup]):
         "header_title",
     ]
     for header_row in header_rows:
-        header_metadata: HeaderMetadata = {}
         for class_name in header_class_list:
             header_cell = header_row.find("td", class_=class_name)
             if header_cell:
-                header_metadata[class_name] = header_cell.text.strip()
-        header_metadata_list.append(header_metadata)
+                text = format_content(header_cell.text)
+                if class_name == "header_title":
+                    if text == "from: unknown":
+                        text = "No title"
+                header_metadata[class_name] = text
+        break
 
-    return header_metadata_list
-
-
-class ImageMetadata(TypedDict):
-    src: NotRequired[str | list[str] | None]
-    alt: NotRequired[str | list[str] | None]
-    href: NotRequired[str | list[str] | None]
-    target: NotRequired[str | list[str] | None]
+    return header_metadata
 
 
-class ContentMetadata(TypedDict):
-    content_image: NotRequired[ImageMetadata]
-    content_table: NotRequired[str]
-    content_text: NotRequired[str]
+def format_content(content: str) -> str:
+    content = content.strip()
+    content = content.replace("\n", " ")
+    content = content.replace("\r", " ")
+    content = content.replace("\t", " ")
+    # remove extra spaces within the content
+    content = " ".join(content.split())
+    return content
 
 
 def extract_content(content_rows: ResultSet[BeautifulSoup]):
@@ -85,7 +103,7 @@ def extract_content(content_rows: ResultSet[BeautifulSoup]):
             if content_cell:
                 if class_name == "content_image":
                     if type(content_cell) == Tag:
-                        image_metadata: ImageMetadata = {}
+                        image_metadata: ImageMetadata = ImageMetadata()
                         image_tag = cast(Tag, content_cell.find("img"))
                         image_metadata["src"] = image_tag.get("src", "")
                         image_metadata["alt"] = image_tag.get("alt", "")
@@ -94,14 +112,14 @@ def extract_content(content_rows: ResultSet[BeautifulSoup]):
                         image_metadata["target"] = image_link_tag.get("target", "")
                         content_metadata[class_name] = image_metadata
                 else:
-                    content_metadata[class_name] = content_cell.text.strip()
+                    content_metadata[class_name] = format_content(content_cell.text)
         content_metadata_list.append(content_metadata)
 
     return content_metadata_list
 
 
 class EntryMetadata(TypedDict):
-    header: list[HeaderMetadata]
+    header: HeaderMetadata
     content: list[ContentMetadata]
 
 
@@ -153,8 +171,162 @@ def extract_all_unique_classes(soup: BeautifulSoup):
             fp.write(f"{class_name}\n")
 
 
-def create_markdown_from_entry_metadata(entry_metadata: list[EntryMetadata]) -> str:
-    return ""
+def index_generator():
+    number = 1
+    index_char = f"{number}."
+    while True:
+        yield index_char
+        number += 1
+        index_char = f"{number}."
+
+
+def markdown_list(content: list[str], list_type: str) -> str:
+    if list_type not in ["ul", "ol"]:
+        raise ValueError("Invalid list type")
+
+    list_str = ""
+    list_char = ""
+    generator = index_generator()
+
+    for item in content:
+        if list_type == "ol":
+            list_char = next(generator)
+        elif list_type == "ul":
+            list_char = "-"
+        list_str += f"{list_char} {item}\n"
+    return list_str
+
+
+def markdown_element(
+    element_type: str,
+    content: str | list[str] | ImageMetadata | dict | None,
+) -> str:
+
+    DEFAULT_IMG_ALT_TEXT = "Image for the entry"
+
+    if content == None or content == "":
+        if element_type == "hr":
+            return "---\n\n"
+        elif element_type == "br":
+            return "\n"
+        else:
+            return ""
+    elif type(content) == list:
+        if element_type == "ul":
+            return markdown_list(content, "ul")
+        elif element_type == "ol":
+            return markdown_list(content, "ol")
+        else:
+            raise ValueError(f"({element_type}) is an invalid element type")
+    elif type(content) == str:
+        if element_type == "p":
+            return f"{content}\n\n"
+        elif element_type == "h1":
+            return f"# {content}\n\n"
+        elif element_type == "h2":
+            return f"## {content}\n\n"
+        elif element_type == "h3":
+            return f"### {content}\n\n"
+        elif element_type == "h4":
+            return f"#### {content}\n\n"
+        elif element_type == "h5":
+            return f"##### {content}\n\n"
+        elif element_type == "h6":
+            return f"###### {content}\n\n"
+        elif element_type == "blockquote":
+            return f"> {content}\n"
+        elif element_type == "code":
+            return f"`{content}`"
+        elif element_type == "pre":
+            return f"```\n{content}\n```\n"
+        elif element_type == "div":
+            return f"{content}\n"
+        elif element_type == "span":
+            return f"{content}\n"
+        else:
+            raise ValueError(f"({element_type}) is an invalid element type")
+    elif type(content) == dict:
+        if element_type == "img":
+            alt_text = content.get("alt", DEFAULT_IMG_ALT_TEXT)
+            if alt_text == "":
+                alt_text = DEFAULT_IMG_ALT_TEXT
+
+            return f"![{alt_text}]({content.get('src')})\n\n"
+        if element_type == "a":
+            return f"[{content.get('target')}]({content.get('href')})\n\n"
+
+        raise ValueError(f"({element_type}) is an invalid element type")
+    else:
+        raise ValueError(f"({type(content)}) is an invalid content type")
+
+    # elif element_type == "table":
+    #     return markdown_table(element)
+
+
+def markdown_entry_template(entry_metadata: EntryMetadata) -> str:
+    header_metadata = entry_metadata["header"]
+    content_metadata = entry_metadata["content"]
+    markdown = ""
+
+    header_string = f'{header_metadata.get("header_author", "")} - {header_metadata.get("header_date", "")} {header_metadata.get("header_time", "")} : {header_metadata.get("header_title", "")}'
+
+    markdown += markdown_element("h3", header_string)
+
+    markdown += markdown_element("p", header_metadata.get("header_category", ""))
+    markdown += markdown_element("p", header_metadata.get("header_severity", ""))
+    markdown += markdown_element("p", header_metadata.get("header_hist", ""))
+
+    for content in content_metadata:
+        markdown += markdown_element("p", content.get("content_text", ""))
+        markdown += markdown_element("p", content.get("content_table", ""))
+        markdown += markdown_element("img", content.get("content_image", None))
+        markdown += markdown_element("a", content.get("content_image", None))
+
+    markdown += markdown_element("hr", None)
+
+    return markdown
+
+
+def markdown_info_template(metadata: FileMetadata) -> str:
+    markdown = ""
+
+    header_string = f'{metadata.get("title", "")} - {metadata.get("date", "")}'
+
+    markdown += markdown_element("h1", f"{header_string}")
+    markdown += markdown_element("h2", "Logbook Entries")
+    markdown += markdown_element("hr", None)
+
+    return markdown
+
+
+def create_markdown(metadata: FileMetadata, entry_metadata: list[EntryMetadata]) -> str:
+
+    markdown = ""
+
+    markdown += markdown_info_template(metadata)
+
+    for entry in entry_metadata:
+        markdown += markdown_entry_template(entry)
+
+    return markdown
+
+
+def extract_metadata(entry_metadata_list: list[EntryMetadata]) -> FileMetadata:
+    metadata: FileMetadata = {
+        "title": "",
+        "date": "",
+    }
+
+    title = "LCLS E-log Logbook"
+    date = ""
+
+    first_entry_header = entry_metadata_list[-1]["header"]
+    date = first_entry_header.get("header_date", date)
+
+    metadata["title"] = title
+    metadata["date"] = date
+
+    return metadata
 
 
 def convert_html_to_md(filename: str):
@@ -168,9 +340,15 @@ def convert_html_to_md(filename: str):
     # Modify the html content
     entry_metadata_list = extract_entries(soup)
 
+    metadata = extract_metadata(entry_metadata_list)
+
+    # Save as json
+    with open(f"{output_dir}/{filename}.json", "w") as fp:
+        fp.write(json.dumps(entry_metadata_list, indent=4))
+
     # Convert the data to markdown
 
-    markdown_data = create_markdown_from_entry_metadata(entry_metadata_list)
+    markdown_data = create_markdown(metadata, entry_metadata_list)
     # markdownify_options = modify_markdownify_options()
     # markdown_data = md(soup, markdownify_options)
 
@@ -178,26 +356,14 @@ def convert_html_to_md(filename: str):
     with open(f"{output_dir}/{filename}.md", "w") as fp:
         fp.write(markdown_data)
 
+    # Format the markdown file
+    try:
+        subprocess.run(["mdformat", f"{output_dir}/{filename}.md"])
+    except Exception as e:
+        raise e
+
 
 def main():
-
-    # file_references = "file-names.csv"
-    # file_metadata = []
-    # with open(file_references, "r") as fp:
-    #     for line in fp:
-    #         line = urllib.parse.unquote(line)
-    #         line = line.strip().split("?")[-1]
-    #         params = line.split("&")
-    #         file = params[0].split("=")[-1]
-    #         xsl = params[1].split("=")[-1]
-    #         picture = params[2].split("=")[-1]
-
-    #         data = {"file": file, "xsl": xsl, "picture": picture}
-    #         file_metadata.append(data)
-
-    # with open("file-metadata.csv", "w") as fp:
-    #     for data in file_metadata:
-    #         fp.write(f"{data['file']},{data['xsl']},{data['picture']}\n")
 
     list_of_files = os.listdir(data_dir)
     for filename in list_of_files:
